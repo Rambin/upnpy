@@ -1,4 +1,6 @@
 import socket
+import select
+from datetime import datetime, timedelta
 from upnpy.ssdp.SSDPHeader import SSDPHeader
 from upnpy.ssdp.SSDPDevice import SSDPDevice
 
@@ -18,8 +20,6 @@ class SSDPRequest(SSDPHeader):
         self.SSDP_PORT = ssdp_port
 
         self.set_header('HOST', f'{self.SSDP_MCAST_ADDR}:{self.SSDP_PORT}')
-
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def m_search(self, discover_delay=2, st='ssdp:all', **headers):
 
@@ -45,9 +45,7 @@ class SSDPRequest(SSDPHeader):
         self.set_header('ST', st)
         self.set_headers(**headers)
 
-        self.socket.settimeout(discover_delay)
-
-        devices = self._send_request(self._get_raw_request())
+        devices = self._send_request(self._get_raw_request(), discover_delay=discover_delay)
 
         for device in devices:
             yield device
@@ -85,21 +83,56 @@ class SSDPRequest(SSDPHeader):
 
         return final_request_data
 
-    def _send_request(self, message):
-        self.socket.sendto(message.encode(), (self.SSDP_MCAST_ADDR, self.SSDP_PORT))
-
+    def _send_request(self, message, discover_delay):
+        req = message.encode()
+        SSDP_TARGET = (self.SSDP_MCAST_ADDR, self.SSDP_PORT)
+        ddl = datetime.now() + timedelta(seconds=discover_delay)
+        
+        sockets = []
+        addrs = set()
+        
+        for addr in socket.gethostbyname_ex(socket.gethostname())[2]:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, discover_delay)
+                sock.bind((addr, 0))
+                sockets.append(sock)
+            except socket.error:
+                pass
+        
+        for sock in [s for s in sockets]:
+            try:
+                sock.sendto(req, SSDP_TARGET)
+                sock.setblocking(False)
+            except socket.error:
+                sockets.remove(sock)
+                sock.close()
+        
         devices = []
-
+        
         try:
-            while True:
-
-                # UDP packet data limit is 65507 imposed by IPv4
-                # https://en.wikipedia.org/wiki/User_Datagram_Protocol#Packet_structure
-
-                response, addr = self.socket.recvfrom(65507)
-                device = SSDPDevice(addr, response.decode())
-                devices.append(device)
-        except socket.timeout:
-            pass
-
+            while sockets:
+                life = (ddl - datetime.now()).total_seconds()
+                if life <= 0:
+                    break
+                
+                ready = select.select(sockets, [], [], life)[0]
+                
+                for sock in ready:
+                    try:
+                        response, addr = sock.recvfrom(65507)
+                        if not addr in addrs:
+                            addrs.add(addr)
+                            devices.append(SSDPDevice(addr, response.decode(), sock.getsockname()[0]))
+                    except UnicodeDecodeError:
+                        continue
+                    except socket.error:
+                        sockets.remove(sock)
+                        sock.close()
+                        continue
+                        
+        finally:
+            for s in sockets:
+                s.close()
+        
         return devices

@@ -68,8 +68,9 @@ class SSDPDevice:
         :type response: str
     """
 
-    def __init__(self, address, response):
+    def __init__(self, address, response, local_address=None):
         self.address = address
+        self.local_address = local_address
         self.host = address[0]
         self.port = address[1]
         self.response = response
